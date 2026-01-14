@@ -84,7 +84,7 @@ def fuse_norm_gate(
 
     gates = torch.empty(B, S, N, 1, dtype=q.dtype, device=q.device)
     BLOCK_N = triton.next_power_of_2(N)
-    BLOCK_D = triton.next_power_of_2(8192 // BLOCK_N)
+    BLOCK_D = triton.next_power_of_2(min(8192 // BLOCK_N, D))
     with torch.cuda.device(q.device):
         _norm_gate_kernel[(S, B)](
             gates,
