@@ -36,8 +36,9 @@ def _norm_gate_kernel(
     n_offset = tl.arange(0, BLOCK_N)
     n_mask = n_offset < N
 
-    q_sum_sq_acc = tl.zeros([BLOCK_N], dtype=tl.float32)
-    k_sum_sq_acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    q_sq_sum = tl.zeros([BLOCK_N], dtype=tl.float32)
+    k_sq_sum = tl.zeros([BLOCK_N], dtype=tl.float32)
+    dot_sum = tl.zeros([BLOCK_N], dtype=tl.float32)
 
     for off_d in range(0, D, BLOCK_D):
         d_offset = off_d + tl.arange(0, BLOCK_D)
@@ -46,39 +47,22 @@ def _norm_gate_kernel(
         cols = n_offset[:, None] * D + d_offset[None, :]
         mask = n_mask[:, None] & d_mask[None, :]
 
-        q = tl.load(q_ptr + cols, mask=mask, other=0.0, eviction_policy='evict_last').to(tl.float32)
-        k = tl.load(k_ptr + cols, mask=mask, other=0.0, eviction_policy='evict_last').to(tl.float32)
-
-        q_sum_sq_acc += tl.sum(q * q, axis=1)
-        k_sum_sq_acc += tl.sum(k * k, axis=1)
-
-    q_rstd = tl.math.rsqrt((q_sum_sq_acc / D) + eps)
-    k_rstd = tl.math.rsqrt((k_sum_sq_acc / D) + eps)
-
-    dot_acc = tl.zeros([BLOCK_N], dtype=tl.float32)
-
-    for off_d in range(0, D, BLOCK_D):
-        d_offset = off_d + tl.arange(0, BLOCK_D)
-        d_mask = d_offset < D
-
-        cols = n_offset[:, None] * D + d_offset[None, :]
-        mask = n_mask[:, None] & d_mask[None, :]
-
-        q = tl.load(q_ptr + cols, mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
-        k = tl.load(k_ptr + cols, mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
+        q = tl.load(q_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        k = tl.load(k_ptr + cols, mask=mask, other=0.0).to(tl.float32)
 
         q_w = tl.load(q_weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         k_w = tl.load(k_weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
 
-        normed_q = q * q_rstd[:, None] * q_w
-        normed_k = k * k_rstd[:, None] * k_w
+        q_sq_sum += tl.sum(q * q, axis=1)
+        k_sq_sum += tl.sum(k * k, axis=1)
+        dot_sum += tl.sum(q * q_w * k * k_w, axis=1)
 
-        dot_acc += tl.sum(normed_q * normed_k, axis=1)
+    q_rstd = tl.math.rsqrt(q_sq_sum / D + eps)
+    k_rstd = tl.math.rsqrt(k_sq_sum / D + eps)
 
-    gate_val = dot_acc * scale
-    abs_gate = tl.abs(gate_val)
-    clamped_gate = tl.maximum(abs_gate, 1e-6)
-    gate_val = tl.sqrt(clamped_gate) * tl.where(gate_val > 0, 1.0, tl.where(gate_val < 0, -1.0, 0.0))
+    gate_val = dot_sum * q_rstd * k_rstd * scale
+    gate_val = gate_val * tl.math.rsqrt(tl.abs(gate_val) + 1e-6)
+
     gate_val = tl.sigmoid(gate_val)
     tl.store(gate_ptr + n_offset, gate_val, mask=n_mask)
 
@@ -99,8 +83,8 @@ def fuse_norm_gate(
     scale = 1 / math.sqrt(hidden_size)
 
     gates = torch.empty(B, S, N, 1, dtype=q.dtype, device=q.device)
-    PAD_N = triton.next_power_of_2(N)
-    PAD_D = triton.next_power_of_2(min(8192 // PAD_N, D))
+    BLOCK_N = triton.next_power_of_2(N)
+    BLOCK_D = triton.next_power_of_2(8192 // BLOCK_N)
     with torch.cuda.device(q.device):
         _norm_gate_kernel[(S, B)](
             gates,
@@ -116,9 +100,9 @@ def fuse_norm_gate(
             D,
             scale,
             eps,
-            PAD_N,
-            PAD_D,
-            num_warps=min(max(PAD_D // 256, 1), 8),
+            BLOCK_N,
+            BLOCK_D,
+            num_warps=min(max(BLOCK_D // 256, 1), 8),
         )
     return gates
 
